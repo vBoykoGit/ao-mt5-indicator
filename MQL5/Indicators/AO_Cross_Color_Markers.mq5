@@ -4,18 +4,18 @@
 //+------------------------------------------------------------------+
 #property copyright   ""
 #property link        ""
-#property version     "1.00"
+#property version     "1.02"
 #property indicator_separate_window
 #property indicator_buffers 9
 #property indicator_plots   7
 
-// Plot 0 — AO histogram (color index 0=green rising, 1=red falling)
+// Plot 0 — AO histogram
 #property indicator_label1  "AO"
 #property indicator_type1   DRAW_COLOR_HISTOGRAM
 #property indicator_color1  clrGreen,clrRed
 #property indicator_width1  4
 
-// Plot 1 — AC histogram (color index 0=lime rising, 1=maroon falling)
+// Plot 1 — AC histogram
 #property indicator_label2  "AC"
 #property indicator_type2   DRAW_COLOR_HISTOGRAM
 #property indicator_color2  clrLime,clrMaroon
@@ -39,13 +39,13 @@
 #property indicator_color5  clrRed
 #property indicator_width5  1
 
-// Plot 5 — Single Bar Down arrow (above bar, AO > 0)
+// Plot 5 — Single Bar Down arrow (in AO subwindow, AO > 0)
 #property indicator_label6  "Single Bar Down"
 #property indicator_type6   DRAW_ARROW
 #property indicator_color6  clrRed
 #property indicator_width6  1
 
-// Plot 6 — Single Bar Up arrow (below bar, AO < 0)
+// Plot 6 — Single Bar Up arrow (in AO subwindow, AO < 0)
 #property indicator_label7  "Single Bar Up"
 #property indicator_type7   DRAW_ARROW
 #property indicator_color7  clrGreen
@@ -109,20 +109,56 @@ input bool UsePushAlert       = false;  // Use Push Notification
 input bool UseEmailAlert      = false;  // Use Email Alert
 
 //+------------------------------------------------------------------+
-//| Indicator buffers (9 total: 7 data + 2 color-index)             |
+//| Indicator buffers                                                |
 //+------------------------------------------------------------------+
-double BufAO[];         // plot 0 data
-double BufAOColor[];    // plot 0 color index
-double BufAC[];         // plot 1 data
-double BufACColor[];    // plot 1 color index
-double BufWMA[];        // plot 2
-double BufAvgPos[];     // plot 3
-double BufAvgNeg[];     // plot 4
-double BufArrowDown[];  // plot 5
-double BufArrowUp[];    // plot 6
+double BufAO[];
+double BufAOColor[];
+double BufAC[];
+double BufACColor[];
+double BufWMA[];
+double BufAvgPos[];
+double BufAvgNeg[];
+double BufArrowDown[];
+double BufArrowUp[];
 
 //+------------------------------------------------------------------+
-//| Vertical-line state machine variables                           |
+//| Global AO array (FIX 1: persists between OnCalculate calls)     |
+//+------------------------------------------------------------------+
+double g_ao[];
+
+//+------------------------------------------------------------------+
+//| Rolling sums for AO = SMA(hl2,5) - SMA(hl2,34)                 |
+//| (FIX 1: O(1) per bar instead of O(34) inner loop)              |
+//+------------------------------------------------------------------+
+double g_sumHL2_5  = 0.0;
+double g_sumHL2_34 = 0.0;
+
+//+------------------------------------------------------------------+
+//| Rolling sum for AC = AO - SMA(AO,5)                            |
+//| (FIX 1: O(1) per bar)                                          |
+//+------------------------------------------------------------------+
+double g_sumAO5 = 0.0;
+
+//+------------------------------------------------------------------+
+//| Rolling sums for display averages (AODisplayAvgLen window)      |
+//| (FIX 2: ТЗ requires rolling sum, not for loop)                  |
+//+------------------------------------------------------------------+
+double g_dispSumPos = 0.0;
+double g_dispCntPos = 0.0;
+double g_dispSumNeg = 0.0;
+double g_dispCntNeg = 0.0;
+
+//+------------------------------------------------------------------+
+//| Rolling sums for strength filter (AOAvgLen window at b1=i-1)   |
+//| (FIX 7: O(1) per bar instead of O(AOAvgLen) inner loop)        |
+//+------------------------------------------------------------------+
+double g_strSumPos = 0.0;
+double g_strCntPos = 0.0;
+double g_strSumNeg = 0.0;
+double g_strCntNeg = 0.0;
+
+//+------------------------------------------------------------------+
+//| Vertical-line state machine                                     |
 //+------------------------------------------------------------------+
 int    g_lastCBar         = -1;
 bool   g_cPending         = false;
@@ -153,11 +189,7 @@ bool   g_peakAlertedNeg = false;
 //|      9=HigherPeak 10=LowerPeak                                  |
 //+------------------------------------------------------------------+
 datetime g_lastAlertTime[11];
-
-//+------------------------------------------------------------------+
-//| Cached current close for alert messages                         |
-//+------------------------------------------------------------------+
-double   g_lastClose   = 0.0;
+double   g_lastClose = 0.0;
 
 //+------------------------------------------------------------------+
 //| Helpers                                                         |
@@ -285,6 +317,17 @@ void SafeDeleteObj(string &name)
    }
 }
 
+void ResetRollingSums()
+{
+   g_sumHL2_5   = 0.0;
+   g_sumHL2_34  = 0.0;
+   g_sumAO5     = 0.0;
+   g_dispSumPos = 0.0;  g_dispCntPos = 0.0;
+   g_dispSumNeg = 0.0;  g_dispCntNeg = 0.0;
+   g_strSumPos  = 0.0;  g_strCntPos  = 0.0;
+   g_strSumNeg  = 0.0;  g_strCntNeg  = 0.0;
+}
+
 void ResetState()
 {
    g_lastCBar         = -1;
@@ -305,6 +348,23 @@ void ResetState()
    g_currPeakNeg      = 0.0;
    g_peakAlertedNeg   = false;
    ArrayInitialize(g_lastAlertTime, 0);
+   ResetRollingSums();
+}
+
+//+------------------------------------------------------------------+
+//| WMA of g_ao[] over [i-period+1 .. i]                           |
+//+------------------------------------------------------------------+
+double WMAAt(int i, int period)
+{
+   if(i < 33 + period - 1) return EMPTY_VALUE;
+   double num = 0.0, den = 0.0;
+   for(int k = 0; k < period; k++)
+   {
+      int w = period - k;
+      num += g_ao[i - k] * w;
+      den += w;
+   }
+   return (den > 0.0) ? num / den : EMPTY_VALUE;
 }
 
 //+------------------------------------------------------------------+
@@ -312,7 +372,6 @@ void ResetState()
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   // Bind buffers
    SetIndexBuffer(0, BufAO,        INDICATOR_DATA);
    SetIndexBuffer(1, BufAOColor,   INDICATOR_COLOR_INDEX);
    SetIndexBuffer(2, BufAC,        INDICATOR_DATA);
@@ -323,11 +382,9 @@ int OnInit()
    SetIndexBuffer(7, BufArrowDown, INDICATOR_DATA);
    SetIndexBuffer(8, BufArrowUp,   INDICATOR_DATA);
 
-   // Arrow codes: 234 = down-pointing, 233 = up-pointing (Wingdings)
    PlotIndexSetInteger(5, PLOT_ARROW, 234);
    PlotIndexSetInteger(6, PLOT_ARROW, 233);
 
-   // Empty value for non-histogram plots
    PlotIndexSetDouble(2, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(3, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(4, PLOT_EMPTY_VALUE, EMPTY_VALUE);
@@ -335,9 +392,9 @@ int OnInit()
    PlotIndexSetDouble(6, PLOT_EMPTY_VALUE, EMPTY_VALUE);
 
    IndicatorSetString(INDICATOR_SHORTNAME, "AO Cross & Color Markers");
-   IndicatorSetInteger(INDICATOR_LEVELS,      1);
-   IndicatorSetDouble (INDICATOR_LEVELVALUE,  0, 0.0);
-   IndicatorSetInteger(INDICATOR_LEVELCOLOR,  0, clrGray);
+   IndicatorSetInteger(INDICATOR_LEVELS,     1);
+   IndicatorSetDouble (INDICATOR_LEVELVALUE, 0, 0.0);
+   IndicatorSetInteger(INDICATOR_LEVELCOLOR, 0, clrGray);
 
    DeleteAOObjects();
    ResetState();
@@ -354,33 +411,6 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
-//| SMA of an array over [i-period+1 .. i]                         |
-//+------------------------------------------------------------------+
-double SMAArr(const double &arr[], int i, int period)
-{
-   if(i < period - 1) return EMPTY_VALUE;
-   double s = 0.0;
-   for(int k = 0; k < period; k++) s += arr[i - k];
-   return s / period;
-}
-
-//+------------------------------------------------------------------+
-//| WMA of an array over [i-period+1 .. i]                         |
-//+------------------------------------------------------------------+
-double WMAArr(const double &arr[], int i, int period)
-{
-   if(i < period - 1) return EMPTY_VALUE;
-   double num = 0.0, den = 0.0;
-   for(int k = 0; k < period; k++)
-   {
-      int w = period - k;
-      num += arr[i - k] * w;
-      den += w;
-   }
-   return (den > 0) ? num / den : EMPTY_VALUE;
-}
-
-//+------------------------------------------------------------------+
 //| OnCalculate                                                     |
 //+------------------------------------------------------------------+
 int OnCalculate(const int rates_total,
@@ -394,93 +424,125 @@ int OnCalculate(const int rates_total,
                 const long     &volume[],
                 const int      &spread[])
 {
-   int minBars = 34 + AOWmaLen + AOAvgLen + 5;
-   if(rates_total < minBars) return 0;
+   // FIX 3: skip intra-bar ticks — recalculate only when a new bar forms
+   if(prev_calculated >= rates_total)
+      return rates_total;
 
+   if(rates_total < 38) return 0; // need at least aoStart(33) + 4 bars for first signal
+
+   // Full recalc: reset everything
    if(prev_calculated == 0)
    {
       DeleteAOObjects();
       ResetState();
-      ArrayInitialize(BufAO,        0.0);
-      ArrayInitialize(BufAC,        0.0);
+      ArrayResize(g_ao, rates_total);
+      ArrayInitialize(g_ao,        0.0);
+      ArrayInitialize(BufAO,       0.0);
+      ArrayInitialize(BufAC,       0.0);
       ArrayInitialize(BufArrowDown, EMPTY_VALUE);
       ArrayInitialize(BufArrowUp,   EMPTY_VALUE);
    }
-
-   // --- Step 1: compute AO array ---
-   double ao[];
-   ArrayResize(ao, rates_total);
-
-   int aoStart = 33; // need 34 bars
-   for(int i = aoStart; i < rates_total; i++)
+   else
    {
-      double sum5 = 0.0, sum34 = 0.0;
-      for(int k = 0; k < 5;  k++) sum5  += (high[i-k] + low[i-k]);
-      for(int k = 0; k < 34; k++) sum34 += (high[i-k] + low[i-k]);
-      ao[i] = sum5 / 10.0 - sum34 / 68.0;
+      ArrayResize(g_ao, rates_total);
    }
 
-   // --- Step 2: fill plot buffers (AO, AC, WMA, AvgPos, AvgNeg) ---
-   int calcFrom = (prev_calculated <= 1) ? aoStart : prev_calculated - 1;
+   // On full recalc start from 0; on new bar start from prev_calculated
+   int calcFrom = (prev_calculated <= 0) ? 0 : prev_calculated;
 
+   // FIX 1+2+7: single loop — rolling sums for AO, AC, AvgPos/Neg, strength filter
    for(int i = calcFrom; i < rates_total; i++)
    {
-      // AO histogram
-      BufAO[i]      = ao[i];
-      BufAOColor[i] = (i > 0 && ao[i] >= ao[i-1]) ? 0.0 : 1.0;
+      // Init arrow slots for new bars (ensures EMPTY_VALUE when no signal)
+      BufArrowDown[i] = EMPTY_VALUE;
+      BufArrowUp[i]   = EMPTY_VALUE;
 
-      // AC = AO - SMA(AO, 5)
-      if(i >= aoStart + 4)
-      {
-         double sma5 = SMAArr(ao, i, 5);
-         double acv  = ao[i] - sma5;
-         BufAC[i]      = acv;
-         BufACColor[i] = (i > 0 && acv >= BufAC[i-1]) ? 0.0 : 1.0;
-      }
-      else
-      {
-         BufAC[i]      = 0.0;
-         BufACColor[i] = 0.0;
-      }
+      // ----------------------------------------------------------------
+      // Rolling sums for SMA(hl2,5) and SMA(hl2,34)
+      // ----------------------------------------------------------------
+      double hl2i = high[i] + low[i];  // = 2 * hl2, divided out later
+      g_sumHL2_5  += hl2i;
+      g_sumHL2_34 += hl2i;
+      if(i >= 5)  g_sumHL2_5  -= (high[i-5]  + low[i-5]);
+      if(i >= 34) g_sumHL2_34 -= (high[i-34] + low[i-34]);
 
-      // AO WMA
-      BufWMA[i] = WMAArr(ao, i, AOWmaLen);
-
-      // AvgPos / AvgNeg over AODisplayAvgLen
-      if(i >= aoStart + AODisplayAvgLen - 1)
+      // ----------------------------------------------------------------
+      // AO (valid from bar 33)
+      // sum / 10 = SMA(hl2,5);  sum / 68 = SMA(hl2,34)
+      // ----------------------------------------------------------------
+      if(i >= 33)
       {
-         double sp = 0.0, cp = 0.0, sn = 0.0, cn = 0.0;
-         for(int k = 0; k < AODisplayAvgLen; k++)
+         g_ao[i] = g_sumHL2_5 / 10.0 - g_sumHL2_34 / 68.0;
+
+         // FIX 4: strict > per ТЗ section 4
+         BufAO[i]      = g_ao[i];
+         BufAOColor[i] = (i > 33 && g_ao[i] > g_ao[i-1]) ? 0.0 : 1.0;
+
+         // Rolling sum for SMA(AO,5) used in AC
+         g_sumAO5 += g_ao[i];
+         if(i >= 38) g_sumAO5 -= g_ao[i-5]; // only remove once we have >=5 AO values
+
+         // AC (valid from bar 37 = 33+4, when SMA(AO,5) has 5 values)
+         if(i >= 37)
          {
-            double v = ao[i-k];
-            if(v > 0.0) { sp += v; cp++; }
-            if(v < 0.0) { sn += v; cn++; }
+            double acv   = g_ao[i] - g_sumAO5 / 5.0;
+            BufAC[i]     = acv;
+            // FIX 4+5: strict >, skip comparison on very first valid AC bar
+            BufACColor[i] = (i > 37 && acv > BufAC[i-1]) ? 0.0 : 1.0;
          }
-         BufAvgPos[i] = (cp > 0) ? sp / cp : EMPTY_VALUE;
-         BufAvgNeg[i] = (cn > 0) ? sn / cn : EMPTY_VALUE;
+
+         // WMA (14-iteration loop acceptable per ТЗ)
+         BufWMA[i] = WMAAt(i, AOWmaLen);
+
+         // ----------------------------------------------------------------
+         // FIX 2: Display avg rolling sums — O(1) per bar, no for loop
+         // Window: [max(33, i-AODisplayAvgLen+1) .. i]
+         // ----------------------------------------------------------------
+         double dv = g_ao[i];
+         if(dv > 0.0) { g_dispSumPos += dv; g_dispCntPos += 1.0; }
+         if(dv < 0.0) { g_dispSumNeg += dv; g_dispCntNeg += 1.0; }
+         int dOut = i - AODisplayAvgLen;
+         if(dOut >= 33)
+         {
+            double vOut = g_ao[dOut];
+            if(vOut > 0.0) { g_dispSumPos -= vOut; g_dispCntPos -= 1.0; }
+            if(vOut < 0.0) { g_dispSumNeg -= vOut; g_dispCntNeg -= 1.0; }
+         }
+         BufAvgPos[i] = (g_dispCntPos > 0.0) ? g_dispSumPos / g_dispCntPos : EMPTY_VALUE;
+         BufAvgNeg[i] = (g_dispCntNeg > 0.0) ? g_dispSumNeg / g_dispCntNeg : EMPTY_VALUE;
       }
-      else
+
+      // ----------------------------------------------------------------
+      // FIX 7: Strength filter rolling sums — O(1) per bar
+      // Window ends at b1 = i-1; when i >= 34, b1=i-1 >= 33 is valid
+      // ----------------------------------------------------------------
+      if(i >= 34)
       {
-         BufAvgPos[i] = EMPTY_VALUE;
-         BufAvgNeg[i] = EMPTY_VALUE;
+         int b1Idx = i - 1;
+         double sv = g_ao[b1Idx];
+         if(sv > 0.0) { g_strSumPos += sv; g_strCntPos += 1.0; }
+         if(sv < 0.0) { g_strSumNeg += sv; g_strCntNeg += 1.0; }
+         int sOut = b1Idx - AOAvgLen;
+         if(sOut >= 33)
+         {
+            double vOut = g_ao[sOut];
+            if(vOut > 0.0) { g_strSumPos -= vOut; g_strCntPos -= 1.0; }
+            if(vOut < 0.0) { g_strSumNeg -= vOut; g_strCntNeg -= 1.0; }
+         }
       }
-   }
 
-   // --- Step 3: signal processing per bar ---
-   // We process each "current bar" index i, looking at bar[1]=i-1, bar[2]=i-2, etc.
-   // Start from enough history; for live updates only the last bar matters,
-   // but on full recalc we iterate all bars.
-   int sigStart = MathMax(calcFrom, aoStart + AOAvgLen + 4);
+      // ----------------------------------------------------------------
+      // FIX 6: Signal processing starts at i=37 (b4=i-4 >= 33=aoStart)
+      // Uses available bars for strength filter (no artificial skip)
+      // ----------------------------------------------------------------
+      if(i < 37) continue;
 
-   for(int i = sigStart; i < rates_total; i++)
-   {
-      int b1 = i - 1; // bar[1] — last closed bar
-      int b2 = i - 2; // bar[2]
-      int b3 = i - 3; // bar[3]
-      int b4 = i - 4; // bar[4]
-      if(b4 < aoStart) continue;
+      int b1 = i - 1;  // last closed bar
+      int b2 = i - 2;
+      int b3 = i - 3;
+      int b4 = i - 4;
 
-      double ao1 = ao[b1], ao2 = ao[b2], ao3 = ao[b3], ao4 = ao[b4];
+      double ao1 = g_ao[b1], ao2 = g_ao[b2], ao3 = g_ao[b3], ao4 = g_ao[b4];
       double wma1 = BufWMA[b1], wma2 = BufWMA[b2];
 
       // 5.1 Zero Cross
@@ -488,20 +550,13 @@ int OnCalculate(const int rates_total,
       bool zeroCrossDown = (ao1 < 0.0 && ao2 >= 0.0);
       bool zeroCross     = zeroCrossUp || zeroCrossDown;
 
-      // 5.2 Color Change + strength filter
+      // 5.2 Color Change + strength filter (rolling sums, no loop)
       int colorNow  = (ao1 > ao2) ? 1 : (ao1 < ao2) ? -1 : 0;
       int colorPrev = (ao2 > ao3) ? 1 : (ao2 < ao3) ? -1 : 0;
       bool colorChangeRaw = (colorNow != colorPrev && colorNow != 0 && colorPrev != 0);
 
-      double sp1 = 0.0, cp1 = 0.0, sn1 = 0.0, cn1 = 0.0;
-      for(int k = 0; k < AOAvgLen; k++)
-      {
-         double v = ao[b1 - k];
-         if(v > 0.0) { sp1 += v; cp1++; }
-         if(v < 0.0) { sn1 += v; cn1++; }
-      }
-      double avgPos1 = (cp1 > 0) ? sp1 / cp1 : EMPTY_VALUE;
-      double avgNeg1 = (cn1 > 0) ? sn1 / cn1 : EMPTY_VALUE;
+      double avgPos1 = (g_strCntPos > 0.0) ? g_strSumPos / g_strCntPos : EMPTY_VALUE;
+      double avgNeg1 = (g_strCntNeg > 0.0) ? g_strSumNeg / g_strCntNeg : EMPTY_VALUE;
 
       bool strongC = false;
       if(ao1 > 0.0 && avgPos1 != EMPTY_VALUE)
@@ -512,22 +567,21 @@ int OnCalculate(const int rates_total,
       bool colorChange = colorChangeRaw && strongC;
 
       // 5.3 Single Bar
-      int colorPrevPrev = (ao3 > ao4) ? 1 : (ao3 < ao4) ? -1 : 0;
+      int  colorPrevPrev = (ao3 > ao4) ? 1 : (ao3 < ao4) ? -1 : 0;
       bool singleBar = (colorPrevPrev != 0 && colorPrev != 0 && colorNow != 0 &&
                         colorPrev != colorPrevPrev && colorPrev != colorNow &&
                         colorPrevPrev == colorNow);
       bool singleBarDown = singleBar && (ao2 > 0.0);
       bool singleBarUp   = singleBar && (ao2 < 0.0);
 
-      // Arrow offset: 20% of max |AO| over last 50 bars, at bar[2]
       if(ShowSingleBar && (singleBarDown || singleBarUp))
       {
          double maxAbs = 0.0;
-         for(int k = 0; k < 50 && (b2-k) >= aoStart; k++)
-            maxAbs = MathMax(maxAbs, MathAbs(ao[b2-k]));
-         double off = maxAbs * 0.20;
-         if(singleBarDown) BufArrowDown[b2] = ao2 + off;
-         if(singleBarUp)   BufArrowUp[b2]   = ao2 - off;
+         for(int k = 0; k < 50 && (b2 - k) >= 33; k++)
+            maxAbs = MathMax(maxAbs, MathAbs(g_ao[b2 - k]));
+         double arrowOff = maxAbs * 0.20;
+         if(singleBarDown) BufArrowDown[b2] = ao2 + arrowOff;
+         if(singleBarUp)   BufArrowUp[b2]   = ao2 - arrowOff;
       }
 
       // 5.4 Saucer
@@ -576,24 +630,22 @@ int OnCalculate(const int rates_total,
       if(newHigherPeak) g_peakAlertedPos = true;
       if(newLowerPeak)  g_peakAlertedNeg = true;
 
-      // 6. OBJ_TEXT markers on main chart
-      if(b1 >= 0 && b1 < rates_total)
+      // 6. OBJ_TEXT markers on main chart (window 0)
       {
-         double hl    = high[b1] - low[b1];
-         double off1  = (hl > 0) ? hl * 0.5 : _Point * 10;
-         double off2  = off1 * 2.0;
+         double hl   = high[b1] - low[b1];
+         double off1 = (hl > 0.0) ? hl * 0.5 : _Point * 10;
 
          if(ShowZeroCross && zeroCross)
             PlaceMarker("AO_ZC_", time[b1], low[b1] - off1, "0");
 
          if(ShowColorChange && colorChange)
-            PlaceMarker("AO_CC_", time[b1], low[b1] - off2, "C");
+            PlaceMarker("AO_CC_", time[b1], low[b1] - off1 * 2.0, "C");
       }
 
       // 7. Vertical lines state machine
       int signalBar = b1;
 
-      bool inZone = false;
+      bool inZone  = false;
       int  zoneCnt = ArraySize(g_zoneStarts);
       for(int z = 0; z < zoneCnt; z++)
       {
@@ -601,7 +653,7 @@ int OnCalculate(const int rates_total,
          { inZone = true; break; }
       }
 
-      // Phase 1: manage live lines
+      // Phase 1
       if(g_linesLive)
       {
          if(signalBar > g_liveZoneEnd)
@@ -630,7 +682,7 @@ int OnCalculate(const int rates_total,
          }
       }
 
-      // Phase 2: create new lines
+      // Phase 2
       if(!inZone)
       {
          if(colorChange && !zeroCross)
@@ -644,11 +696,11 @@ int OnCalculate(const int rates_total,
             g_cPending = false;
             if(!g_linesLive)
             {
-               int newStart = g_lastCBar + 21;
-               int newEnd   = g_lastCBar + 34;
-               bool zeroInOwn = (signalBar >= newStart && signalBar <= newEnd);
-               bool overlap   = false;
-               int  nz        = ArraySize(g_zoneStarts);
+               int  newStart    = g_lastCBar + 21;
+               int  newEnd      = g_lastCBar + 34;
+               bool zeroInOwn   = (signalBar >= newStart && signalBar <= newEnd);
+               bool overlap     = false;
+               int  nz          = ArraySize(g_zoneStarts);
                for(int z = 0; z < nz; z++)
                {
                   if(newStart <= g_zoneEnds[z] && newEnd >= g_zoneStarts[z])
@@ -656,11 +708,11 @@ int OnCalculate(const int rates_total,
                }
                if(ShowVLines && !overlap && !zeroInOwn)
                {
-                  color vclr = (g_lastAoAtC > 0.0) ? VLineBullColor : VLineBearColor;
-                  datetime t21 = (newStart < rates_total) ? time[newStart] :
-                                  time[rates_total-1] + (long)(newStart - rates_total + 1) * PeriodSeconds();
-                  datetime t34 = (newEnd   < rates_total) ? time[newEnd] :
-                                  time[rates_total-1] + (long)(newEnd   - rates_total + 1) * PeriodSeconds();
+                  color    vclr = (g_lastAoAtC > 0.0) ? VLineBullColor : VLineBearColor;
+                  datetime t21  = (newStart < rates_total) ? time[newStart] :
+                                   time[rates_total-1] + (long)(newStart - rates_total + 1) * PeriodSeconds();
+                  datetime t34  = (newEnd   < rates_total) ? time[newEnd] :
+                                   time[rates_total-1] + (long)(newEnd   - rates_total + 1) * PeriodSeconds();
                   g_vline21Name = CreateVLine(t21, vclr);
                   g_vline34Name = CreateVLine(t34, vclr);
                   int sz = ArraySize(g_zoneStarts);
@@ -681,7 +733,7 @@ int OnCalculate(const int rates_total,
          }
       }
 
-      // 8. Alerts — only on the live (forming) bar
+      // 8. Alerts (FIX 3: fires once per bar-close since same-bar ticks return early)
       if(i == rates_total - 1)
       {
          g_lastClose = close[rates_total - 1];
