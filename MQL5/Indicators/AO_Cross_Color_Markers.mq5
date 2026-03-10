@@ -51,9 +51,8 @@
 #property indicator_color7  clrGreen
 #property indicator_width7  1
 
-#property indicator_levelcolor clrGray
-#property indicator_levels     1
-#property indicator_levelvalue 0
+#property indicator_level1      0.0
+#property indicator_levelcolor  clrGray
 
 //+------------------------------------------------------------------+
 //| Enums                                                            |
@@ -392,9 +391,6 @@ int OnInit()
    PlotIndexSetDouble(6, PLOT_EMPTY_VALUE, EMPTY_VALUE);
 
    IndicatorSetString(INDICATOR_SHORTNAME, "AO Cross & Color Markers");
-   IndicatorSetInteger(INDICATOR_LEVELS,     1);
-   IndicatorSetDouble (INDICATOR_LEVELVALUE, 0, 0.0);
-   IndicatorSetInteger(INDICATOR_LEVELCOLOR, 0, clrGray);
 
    DeleteAOObjects();
    ResetState();
@@ -710,9 +706,9 @@ int OnCalculate(const int rates_total,
                {
                   color    vclr = (g_lastAoAtC > 0.0) ? VLineBullColor : VLineBearColor;
                   datetime t21  = (newStart < rates_total) ? time[newStart] :
-                                   time[rates_total-1] + (long)(newStart - rates_total + 1) * PeriodSeconds();
+                                   (datetime)(time[rates_total-1] + (long)(newStart - rates_total + 1) * PeriodSeconds());
                   datetime t34  = (newEnd   < rates_total) ? time[newEnd] :
-                                   time[rates_total-1] + (long)(newEnd   - rates_total + 1) * PeriodSeconds();
+                                   (datetime)(time[rates_total-1] + (long)(newEnd   - rates_total + 1) * PeriodSeconds());
                   g_vline21Name = CreateVLine(t21, vclr);
                   g_vline34Name = CreateVLine(t34, vclr);
                   int sz = ArraySize(g_zoneStarts);
