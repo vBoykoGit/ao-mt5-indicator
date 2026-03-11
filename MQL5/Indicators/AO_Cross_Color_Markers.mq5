@@ -4,7 +4,7 @@
 //+------------------------------------------------------------------+
 #property copyright   ""
 #property link        ""
-#property version     "1.02"
+#property version     "1.03"
 #property indicator_separate_window
 #property indicator_buffers 9
 #property indicator_plots   7
@@ -124,6 +124,7 @@ double BufArrowUp[];
 //| Global AO array (FIX 1: persists between OnCalculate calls)     |
 //+------------------------------------------------------------------+
 double g_ao[];
+double g_hl2x2[];
 
 //+------------------------------------------------------------------+
 //| Rolling sums for AO = SMA(hl2,5) - SMA(hl2,34)                 |
@@ -165,11 +166,14 @@ double g_lastAoAtC        = 0.0;
 bool   g_linesLive        = false;
 int    g_liveZoneStart    = -1;
 int    g_liveZoneEnd      = -1;
+int    g_vline21Bar       = -1;
+int    g_vline34Bar       = -1;
 bool   g_preZoneProtected = false;
 int    g_zoneStarts[];
 int    g_zoneEnds[];
 string g_vline21Name      = "";
 string g_vline34Name      = "";
+string g_objPrefix        = "";
 
 //+------------------------------------------------------------------+
 //| Peak detection state                                            |
@@ -244,12 +248,13 @@ void TryAlert(int idx, string signalName, bool condition, bool flag)
 
 void DeleteAOObjects()
 {
+   if(g_objPrefix == "") return;
    long cid   = ChartID();
    int  total = ObjectsTotal(cid, 0, -1);
    for(int i = total - 1; i >= 0; i--)
    {
       string name = ObjectName(cid, i, 0, -1);
-      if(StringFind(name, "AO_") == 0)
+      if(StringFind(name, g_objPrefix) == 0)
          ObjectDelete(cid, name);
    }
 }
@@ -269,7 +274,7 @@ int GetMarkerFontSize()
 
 void PlaceMarker(string prefix, datetime barTime, double price, string txt)
 {
-   string name = prefix + (string)barTime;
+   string name = g_objPrefix + prefix + (string)barTime;
    long   cid  = ChartID();
    if(ObjectFind(cid, name) >= 0) return;
    ObjectCreate(cid, name, OBJ_TEXT, 0, barTime, price);
@@ -295,7 +300,7 @@ ENUM_LINE_STYLE GetVLineStyle()
 
 string CreateVLine(datetime t, color clr)
 {
-   string name = "AO_VL_" + (string)t;
+   string name = g_objPrefix + "VL_" + (string)t;
    long   cid  = ChartID();
    if(ObjectFind(cid, name) >= 0) ObjectDelete(cid, name);
    ObjectCreate(cid, name, OBJ_VLINE, 0, t, 0.0);
@@ -335,6 +340,8 @@ void ResetState()
    g_linesLive        = false;
    g_liveZoneStart    = -1;
    g_liveZoneEnd      = -1;
+   g_vline21Bar       = -1;
+   g_vline34Bar       = -1;
    g_preZoneProtected = false;
    ArrayResize(g_zoneStarts, 0);
    ArrayResize(g_zoneEnds,   0);
@@ -348,6 +355,27 @@ void ResetState()
    g_peakAlertedNeg   = false;
    ArrayInitialize(g_lastAlertTime, 0);
    ResetRollingSums();
+}
+
+void ReplaceSignedValue(double oldValue,
+                        double newValue,
+                        double &sumPos,
+                        double &cntPos,
+                        double &sumNeg,
+                        double &cntNeg)
+{
+   if(oldValue > 0.0) { sumPos -= oldValue; cntPos -= 1.0; }
+   if(oldValue < 0.0) { sumNeg -= oldValue; cntNeg -= 1.0; }
+   if(newValue > 0.0) { sumPos += newValue; cntPos += 1.0; }
+   if(newValue < 0.0) { sumNeg += newValue; cntNeg += 1.0; }
+}
+
+void TryCreatePendingVLines(const datetime &time[], int rates_total, color clr)
+{
+   if(g_vline21Name == "" && g_vline21Bar >= 0 && g_vline21Bar < rates_total)
+      g_vline21Name = CreateVLine(time[g_vline21Bar], clr);
+   if(g_vline34Name == "" && g_vline34Bar >= 0 && g_vline34Bar < rates_total)
+      g_vline34Name = CreateVLine(time[g_vline34Bar], clr);
 }
 
 //+------------------------------------------------------------------+
@@ -371,6 +399,12 @@ double WMAAt(int i, int period)
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   if(AOAvgLen <= 0 || AODisplayAvgLen <= 0 || AOWmaLen <= 0)
+   {
+      Print("AO_Cross_Color_Markers: AOAvgLen, AODisplayAvgLen, and AOWmaLen must be > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
    SetIndexBuffer(0, BufAO,        INDICATOR_DATA);
    SetIndexBuffer(1, BufAOColor,   INDICATOR_COLOR_INDEX);
    SetIndexBuffer(2, BufAC,        INDICATOR_DATA);
@@ -384,12 +418,27 @@ int OnInit()
    PlotIndexSetInteger(5, PLOT_ARROW, 234);
    PlotIndexSetInteger(6, PLOT_ARROW, 233);
 
+   PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(2, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(3, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(4, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(5, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(6, PLOT_EMPTY_VALUE, EMPTY_VALUE);
 
+   ArraySetAsSeries(BufAO,        false);
+   ArraySetAsSeries(BufAOColor,   false);
+   ArraySetAsSeries(BufAC,        false);
+   ArraySetAsSeries(BufACColor,   false);
+   ArraySetAsSeries(BufWMA,       false);
+   ArraySetAsSeries(BufAvgPos,    false);
+   ArraySetAsSeries(BufAvgNeg,    false);
+   ArraySetAsSeries(BufArrowDown, false);
+   ArraySetAsSeries(BufArrowUp,   false);
+   ArraySetAsSeries(g_ao,         false);
+   ArraySetAsSeries(g_hl2x2,      false);
+
+   g_objPrefix = StringFormat("AO_%I64d_%u_", ChartID(), (uint)GetTickCount());
    IndicatorSetString(INDICATOR_SHORTNAME, "AO Cross & Color Markers");
 
    DeleteAOObjects();
@@ -420,11 +469,15 @@ int OnCalculate(const int rates_total,
                 const long     &volume[],
                 const int      &spread[])
 {
-   // FIX 3: skip intra-bar ticks — recalculate only when a new bar forms
-   if(prev_calculated >= rates_total)
-      return rates_total;
+   ArraySetAsSeries(time,  false);
+   ArraySetAsSeries(open,  false);
+   ArraySetAsSeries(high,  false);
+   ArraySetAsSeries(low,   false);
+   ArraySetAsSeries(close, false);
 
    if(rates_total < 38) return 0; // need at least aoStart(33) + 4 bars for first signal
+
+   bool sameBarTick = (prev_calculated > 0 && prev_calculated >= rates_total);
 
    // Full recalc: reset everything
    if(prev_calculated == 0)
@@ -432,15 +485,56 @@ int OnCalculate(const int rates_total,
       DeleteAOObjects();
       ResetState();
       ArrayResize(g_ao, rates_total);
+      ArrayResize(g_hl2x2, rates_total);
       ArrayInitialize(g_ao,        0.0);
-      ArrayInitialize(BufAO,       0.0);
-      ArrayInitialize(BufAC,       0.0);
+      ArrayInitialize(g_hl2x2,     0.0);
+      ArrayInitialize(BufAO,       EMPTY_VALUE);
+      ArrayInitialize(BufAOColor,  0.0);
+      ArrayInitialize(BufAC,       EMPTY_VALUE);
+      ArrayInitialize(BufACColor,  0.0);
+      ArrayInitialize(BufWMA,      EMPTY_VALUE);
+      ArrayInitialize(BufAvgPos,   EMPTY_VALUE);
+      ArrayInitialize(BufAvgNeg,   EMPTY_VALUE);
       ArrayInitialize(BufArrowDown, EMPTY_VALUE);
       ArrayInitialize(BufArrowUp,   EMPTY_VALUE);
    }
    else
    {
       ArrayResize(g_ao, rates_total);
+      ArrayResize(g_hl2x2, rates_total);
+   }
+
+   // Recalculate the current forming bar on every tick so the next bar-close
+   // logic sees finalized AO values in tester/live-forward mode.
+   if(sameBarTick)
+   {
+      int i = rates_total - 1;
+
+      double hl2Prev = g_hl2x2[i];
+      double hl2Now  = high[i] + low[i];
+      double aoPrev  = g_ao[i];
+
+      g_sumHL2_5  += (hl2Now - hl2Prev);
+      g_sumHL2_34 += (hl2Now - hl2Prev);
+      g_hl2x2[i]   = hl2Now;
+
+      g_ao[i]        = g_sumHL2_5 / 10.0 - g_sumHL2_34 / 68.0;
+      BufAO[i]       = g_ao[i];
+      BufAOColor[i]  = (i > 33 && g_ao[i] > g_ao[i-1]) ? 0.0 : 1.0;
+
+      g_sumAO5 += (g_ao[i] - aoPrev);
+      BufAC[i]      = g_ao[i] - g_sumAO5 / 5.0;
+      BufACColor[i] = (i > 37 && BufAC[i] > BufAC[i-1]) ? 0.0 : 1.0;
+      BufWMA[i]     = WMAAt(i, AOWmaLen);
+
+      ReplaceSignedValue(aoPrev, g_ao[i],
+                         g_dispSumPos, g_dispCntPos,
+                         g_dispSumNeg, g_dispCntNeg);
+      BufAvgPos[i] = (g_dispCntPos > 0.0) ? g_dispSumPos / g_dispCntPos : EMPTY_VALUE;
+      BufAvgNeg[i] = (g_dispCntNeg > 0.0) ? g_dispSumNeg / g_dispCntNeg : EMPTY_VALUE;
+
+      ChartRedraw(ChartID());
+      return rates_total;
    }
 
    // On full recalc start from 0; on new bar start from prev_calculated
@@ -449,6 +543,13 @@ int OnCalculate(const int rates_total,
    // FIX 1+2+7: single loop — rolling sums for AO, AC, AvgPos/Neg, strength filter
    for(int i = calcFrom; i < rates_total; i++)
    {
+      BufAO[i]        = EMPTY_VALUE;
+      BufAC[i]        = EMPTY_VALUE;
+      BufWMA[i]       = EMPTY_VALUE;
+      BufAvgPos[i]    = EMPTY_VALUE;
+      BufAvgNeg[i]    = EMPTY_VALUE;
+      BufAOColor[i]   = 0.0;
+      BufACColor[i]   = 0.0;
       // Init arrow slots for new bars (ensures EMPTY_VALUE when no signal)
       BufArrowDown[i] = EMPTY_VALUE;
       BufArrowUp[i]   = EMPTY_VALUE;
@@ -457,6 +558,7 @@ int OnCalculate(const int rates_total,
       // Rolling sums for SMA(hl2,5) and SMA(hl2,34)
       // ----------------------------------------------------------------
       double hl2i = high[i] + low[i];  // = 2 * hl2, divided out later
+      g_hl2x2[i]    = hl2i;
       g_sumHL2_5  += hl2i;
       g_sumHL2_34 += hl2i;
       if(i >= 5)  g_sumHL2_5  -= (high[i-5]  + low[i-5]);
@@ -652,6 +754,8 @@ int OnCalculate(const int rates_total,
       // Phase 1
       if(g_linesLive)
       {
+         TryCreatePendingVLines(time, rates_total,
+                                (g_lastAoAtC > 0.0) ? VLineBullColor : VLineBearColor);
          if(signalBar > g_liveZoneEnd)
          {
             g_linesLive = false;
@@ -704,13 +808,10 @@ int OnCalculate(const int rates_total,
                }
                if(ShowVLines && !overlap && !zeroInOwn)
                {
-                  color    vclr = (g_lastAoAtC > 0.0) ? VLineBullColor : VLineBearColor;
-                  datetime t21  = (newStart < rates_total) ? time[newStart] :
-                                   (datetime)(time[rates_total-1] + (long)(newStart - rates_total + 1) * PeriodSeconds());
-                  datetime t34  = (newEnd   < rates_total) ? time[newEnd] :
-                                   (datetime)(time[rates_total-1] + (long)(newEnd   - rates_total + 1) * PeriodSeconds());
-                  g_vline21Name = CreateVLine(t21, vclr);
-                  g_vline34Name = CreateVLine(t34, vclr);
+                  g_vline21Name = "";
+                  g_vline34Name = "";
+                  g_vline21Bar  = newStart;
+                  g_vline34Bar  = newEnd;
                   int sz = ArraySize(g_zoneStarts);
                   ArrayResize(g_zoneStarts, sz + 1);
                   ArrayResize(g_zoneEnds,   sz + 1);
@@ -720,6 +821,8 @@ int OnCalculate(const int rates_total,
                   g_liveZoneEnd      = newEnd;
                   g_linesLive        = true;
                   g_preZoneProtected = false;
+                  TryCreatePendingVLines(time, rates_total,
+                                         (g_lastAoAtC > 0.0) ? VLineBullColor : VLineBearColor);
                }
             }
          }
@@ -730,9 +833,9 @@ int OnCalculate(const int rates_total,
       }
 
       // 8. Alerts (FIX 3: fires once per bar-close since same-bar ticks return early)
-      if(i == rates_total - 1)
+      if(prev_calculated > 0 && i == rates_total - 1)
       {
-         g_lastClose = close[rates_total - 1];
+         g_lastClose = close[b1];
          TryAlert(0,  "Zero Cross UP",    zeroCrossUp,   AlertOnZeroCross);
          TryAlert(1,  "Zero Cross DOWN",  zeroCrossDown, AlertOnZeroCross);
          TryAlert(2,  "Color Change (C)", colorChange,   AlertOnColorChange);
